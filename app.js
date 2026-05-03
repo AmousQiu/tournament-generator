@@ -1,22 +1,38 @@
 // Tournament Generator - Main Application Logic
 
 let nextId = 1;
+const samplePlayerNames = [
+    "Alex",
+    "Jordan",
+    "Taylor",
+    "Casey",
+    "Morgan",
+    "Riley",
+    "Jamie",
+    "Avery",
+    "Cameron",
+    "Quinn",
+    "Parker",
+    "Skyler"
+];
 
-let state = {
-    players: [],
-    type: "",
-    rounds: [],
-    note: "",
-    swiss: { maxRounds: 0 },
-    double: { losses: {} }
-};
+function createEmptyState() {
+    return {
+        players: [],
+        type: "double",
+        rounds: [],
+        note: "",
+        double: { losses: {} }
+    };
+}
+
+let state = createEmptyState();
 
 const ui = {
     setupSection: null,
     bracketSection: null,
     playerCount: null,
     playerNames: null,
-    typeSelect: null,
     bracketDisplay: null,
     standingsDisplay: null,
     note: null,
@@ -29,7 +45,6 @@ document.addEventListener("DOMContentLoaded", () => {
     ui.bracketSection = document.getElementById("bracket-section");
     ui.playerCount = document.getElementById("player-count");
     ui.playerNames = document.getElementById("player-names");
-    ui.typeSelect = document.getElementById("tournament-type");
     ui.bracketDisplay = document.getElementById("bracket-display");
     ui.standingsDisplay = document.getElementById("standings-display");
     ui.note = document.getElementById("tournament-note");
@@ -38,6 +53,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     document.getElementById("generate-player-fields").addEventListener("click", generatePlayerFields);
     document.getElementById("generate-bracket").addEventListener("click", generateTournament);
+    document.getElementById("import-btn-setup").addEventListener("click", () => ui.importFile.click());
     document.getElementById("export-btn").addEventListener("click", exportTournament);
     document.getElementById("import-btn").addEventListener("click", () => ui.importFile.click());
     document.getElementById("reset-btn").addEventListener("click", resetTournament);
@@ -67,6 +83,199 @@ function getPlayerName(id) {
     return p ? p.name : "TBD";
 }
 
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, (char) => {
+        if (char === "&") return "&amp;";
+        if (char === "<") return "&lt;";
+        if (char === ">") return "&gt;";
+        if (char === "\"") return "&quot;";
+        return "&#39;";
+    });
+}
+
+function getSeedOrder(size) {
+    let order = [1, 2];
+    while (order.length < size) {
+        const nextSize = order.length * 2;
+        const next = [];
+        order.forEach((seed) => {
+            next.push(seed);
+            next.push(nextSize + 1 - seed);
+        });
+        order = next;
+    }
+    return order;
+}
+
+function deriveDoubleLosses(players, rounds) {
+    const losses = {};
+    players.forEach((player) => {
+        losses[player.id] = 0;
+    });
+
+    rounds.forEach((round) => {
+        round.forEach((match) => {
+            if (isRealPlayerId(match.loserId)) {
+                losses[match.loserId] = (losses[match.loserId] || 0) + 1;
+            }
+        });
+    });
+
+    return losses;
+}
+
+function applyImportedRoundTitles(importedState) {
+    const bracketSize = 2 ** Math.ceil(Math.log2(importedState.players.length));
+    const winnersRoundCount = Math.log2(bracketSize);
+    let cursor = 0;
+
+    if (winnersRoundCount === 1) {
+        if (importedState.rounds[cursor]) importedState.rounds[cursor].title = "Winners Final";
+        if (importedState.rounds[cursor + 1]) importedState.rounds[cursor + 1].title = "Grand Final";
+        if (importedState.rounds[cursor + 2]) importedState.rounds[cursor + 2].title = "Grand Final Reset";
+        return;
+    }
+
+    if (importedState.rounds[cursor]) importedState.rounds[cursor].title = "Winners Round 1";
+    cursor += 1;
+    for (let block = 1; block < winnersRoundCount; block += 1) {
+        if (importedState.rounds[cursor]) importedState.rounds[cursor].title = `Losers Round ${block * 2 - 1}`;
+        if (importedState.rounds[cursor + 1]) {
+            importedState.rounds[cursor + 1].title = block === winnersRoundCount - 1
+                ? "Winners Final"
+                : `Winners Round ${block + 1}`;
+        }
+        if (importedState.rounds[cursor + 2]) importedState.rounds[cursor + 2].title = `Losers Round ${block * 2}`;
+        cursor += 3;
+    }
+    if (importedState.rounds[cursor]) importedState.rounds[cursor].title = "Grand Final";
+    if (importedState.rounds[cursor + 1]) importedState.rounds[cursor + 1].title = "Grand Final Reset";
+}
+
+function normalizeImportedState(payload) {
+    if (!payload || typeof payload !== "object" || !payload.state || typeof payload.state !== "object") {
+        throw new Error("Invalid file format.");
+    }
+
+    const rawState = payload.state;
+    if (rawState.type !== "double") {
+        throw new Error("Only double-elimination tournaments can be imported.");
+    }
+
+    if (!Array.isArray(rawState.players) || !Array.isArray(rawState.rounds)) {
+        throw new Error("Invalid file format.");
+    }
+
+    const players = rawState.players.map((player, index) => {
+        if (!player || typeof player !== "object") {
+            throw new Error(`Invalid player at index ${index}.`);
+        }
+
+        const id = Number(player.id);
+        const name = typeof player.name === "string" ? player.name.trim() : "";
+        if (!Number.isInteger(id) || id <= 0 || !name) {
+            throw new Error(`Invalid player at index ${index}.`);
+        }
+
+        return { id, name };
+    });
+
+    const playerIds = new Set(players.map((player) => player.id));
+    if (playerIds.size !== players.length) {
+        throw new Error("Player IDs must be unique.");
+    }
+
+    const normalizeRef = (value, allowUndefined = false) => {
+        if (value === undefined && allowUndefined) return undefined;
+        if (value === null) return null;
+        if (typeof value === "number" && playerIds.has(value)) return value;
+        throw new Error("Imported match references an unknown player.");
+    };
+
+    const normalizeScore = (value) => {
+        if (value === null || value === undefined || value === "") return null;
+        if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+        throw new Error("Imported match has an invalid score.");
+    };
+
+    const rounds = rawState.rounds.map((round, roundIndex) => {
+        if (!Array.isArray(round)) {
+            throw new Error(`Invalid round at index ${roundIndex}.`);
+        }
+
+        return round.map((match, matchIndex) => {
+            if (!match || typeof match !== "object") {
+                throw new Error(`Invalid match at round ${roundIndex + 1}.`);
+            }
+
+            const p1Id = normalizeRef(match.p1Id, true);
+            const p2Id = normalizeRef(match.p2Id, true);
+            const score1 = normalizeScore(match.score1);
+            const score2 = normalizeScore(match.score2);
+            const completed = Boolean(match.completed);
+
+            let winnerId = null;
+            let loserId = null;
+
+            if (completed) {
+                if (isRealPlayerId(p1Id) && p2Id === null) {
+                    winnerId = p1Id;
+                } else if (isRealPlayerId(p2Id) && p1Id === null) {
+                    winnerId = p2Id;
+                } else if (isRealPlayerId(p1Id) && isRealPlayerId(p2Id) && score1 !== null && score2 !== null) {
+                    if (score1 > score2) {
+                        winnerId = p1Id;
+                        loserId = p2Id;
+                    } else if (score2 > score1) {
+                        winnerId = p2Id;
+                        loserId = p1Id;
+                    }
+                }
+            }
+
+            return {
+                id: Number.isInteger(match.id) && match.id > 0 ? match.id : uid(),
+                roundIndex: Number.isInteger(match.roundIndex) ? match.roundIndex : roundIndex,
+                indexInRound: Number.isInteger(match.indexInRound) ? match.indexInRound : matchIndex,
+                p1Id,
+                p2Id,
+                score1,
+                score2,
+                winnerId,
+                loserId,
+                completed,
+                nextMatchId: match.nextMatchId === null || match.nextMatchId === undefined
+                    ? null
+                    : Number.isInteger(match.nextMatchId)
+                        ? match.nextMatchId
+                        : null,
+                nextSlot: match.nextSlot === "p1Id" || match.nextSlot === "p2Id" ? match.nextSlot : null,
+                loserNextMatchId: match.loserNextMatchId === null || match.loserNextMatchId === undefined
+                    ? null
+                    : Number.isInteger(match.loserNextMatchId)
+                        ? match.loserNextMatchId
+                        : null,
+                loserNextSlot: match.loserNextSlot === "p1Id" || match.loserNextSlot === "p2Id" ? match.loserNextSlot : null,
+                bracketRole: typeof match.bracketRole === "string" ? match.bracketRole : null
+            };
+        });
+    });
+
+    const importedState = createEmptyState();
+    importedState.players = players;
+    importedState.type = "double";
+    importedState.rounds = rounds;
+    importedState.note = typeof rawState.note === "string" ? rawState.note : "";
+    importedState.double.losses = deriveDoubleLosses(players, rounds);
+    applyImportedRoundTitles(importedState);
+
+    nextId = Number.isInteger(payload.nextId) && payload.nextId > 0
+        ? payload.nextId
+        : Math.max(1, ...rounds.flat().map((match) => match.id + 1));
+
+    return importedState;
+}
+
 function generatePlayerFields() {
     const count = clamp(parseInt(ui.playerCount.value, 10) || 4, 2, 32);
     ui.playerCount.value = String(count);
@@ -77,7 +286,7 @@ function generatePlayerFields() {
         row.className = "player-field";
         row.innerHTML = `
             <label for="player-${i}">Player ${i}</label>
-            <input type="text" id="player-${i}" placeholder="Name" maxlength="24">
+            <input type="text" id="player-${i}" placeholder="${samplePlayerNames[(i - 1) % samplePlayerNames.length]}" maxlength="24">
         `;
         ui.playerNames.appendChild(row);
     }
@@ -104,239 +313,176 @@ function generateTournament() {
         return;
     }
 
-    state = {
-        players,
-        type: ui.typeSelect.value,
-        rounds: [],
-        note: "",
-        swiss: { maxRounds: 0 },
-        double: { losses: {} }
-    };
-
-    if (state.type === "single") {
-        state.rounds = buildSingleElimination(players);
-        state.note = "Single elimination: lose once and you are out.";
-    } else if (state.type === "double") {
-        state.rounds = [buildDoubleRound(players, {})];
-        players.forEach((p) => {
-            state.double.losses[p.id] = 0;
-        });
-        state.note = "Double elimination: players are out after 2 losses.";
-    } else if (state.type === "round-robin") {
-        state.rounds = buildRoundRobin(players);
-        state.note = "Round robin: everyone plays everyone once.";
-    } else {
-        state.swiss.maxRounds = Math.ceil(Math.log2(players.length)) + 1;
-        state.rounds = [buildSwissRound(players, [])];
-        state.note = `Swiss system: ${state.swiss.maxRounds} rounds total.`;
-    }
+    state = createEmptyState();
+    state.players = players;
+    state.rounds = buildDoubleElimination(players);
+    players.forEach((player) => {
+        state.double.losses[player.id] = 0;
+    });
+    state.note = "Double elimination: the full bracket is generated up front and updated as results come in.";
 
     ui.setupSection.classList.add("hidden");
     ui.bracketSection.classList.remove("hidden");
     render();
 }
 
-function buildSingleElimination(players) {
+function createMatch(roundIndex, indexInRound, p1Id = undefined, p2Id = undefined, bracketRole = null) {
+    return {
+        id: uid(),
+        roundIndex,
+        indexInRound,
+        p1Id,
+        p2Id,
+        score1: null,
+        score2: null,
+        winnerId: null,
+        loserId: null,
+        completed: false,
+        nextMatchId: null,
+        nextSlot: null,
+        loserNextMatchId: null,
+        loserNextSlot: null,
+        bracketRole
+    };
+}
+
+function createRound(title) {
+    const round = [];
+    round.title = title;
+    return round;
+}
+
+function assignWinner(match, nextMatch, slot) {
+    match.nextMatchId = nextMatch.id;
+    match.nextSlot = slot;
+}
+
+function assignLoser(match, nextMatch, slot) {
+    match.loserNextMatchId = nextMatch.id;
+    match.loserNextSlot = slot;
+}
+
+function buildDoubleElimination(players) {
     const bracketSize = 2 ** Math.ceil(Math.log2(players.length));
-    const roundCount = Math.log2(bracketSize);
-    const rounds = [];
+    const winnersRoundCount = Math.log2(bracketSize);
+    const firstSlots = getSeedOrder(bracketSize).map((seed) => {
+        const player = players[seed - 1];
+        return player ? player.id : null;
+    });
 
-    const byes = bracketSize - players.length;
-    const firstSlots = new Array(bracketSize).fill(null);
-    for (let i = 0; i < players.length; i += 1) {
-        if (i < byes) {
-            firstSlots[i * 2] = players[i].id;
-        } else {
-            const offset = byes * 2 + (i - byes);
-            firstSlots[offset] = players[i].id;
-        }
-    }
-
-    for (let r = 0; r < roundCount; r += 1) {
-        const matchesInRound = bracketSize / (2 ** (r + 1));
-        const round = [];
+    const winnersRounds = [];
+    for (let roundIndex = 0; roundIndex < winnersRoundCount; roundIndex += 1) {
+        const title = roundIndex === winnersRoundCount - 1
+            ? "Winners Final"
+            : `Winners Round ${roundIndex + 1}`;
+        const round = createRound(title);
+        const matchesInRound = bracketSize / (2 ** (roundIndex + 1));
         for (let i = 0; i < matchesInRound; i += 1) {
-            round.push({
-                id: uid(),
-                roundIndex: r,
-                indexInRound: i,
-                p1Id: r === 0 ? firstSlots[i * 2] : undefined,
-                p2Id: r === 0 ? firstSlots[i * 2 + 1] : undefined,
-                score1: null,
-                score2: null,
-                winnerId: null,
-                loserId: null,
-                completed: false,
-                nextMatchId: null,
-                nextSlot: null
-            });
+            round.push(createMatch(
+                roundIndex,
+                i,
+                roundIndex === 0 ? firstSlots[i * 2] : undefined,
+                roundIndex === 0 ? firstSlots[i * 2 + 1] : undefined
+            ));
         }
-        rounds.push(round);
+        winnersRounds.push(round);
     }
 
-    for (let r = 0; r < rounds.length - 1; r += 1) {
-        rounds[r].forEach((match, i) => {
-            const next = rounds[r + 1][Math.floor(i / 2)];
-            match.nextMatchId = next.id;
-            match.nextSlot = i % 2 === 0 ? "p1Id" : "p2Id";
+    for (let roundIndex = 0; roundIndex < winnersRounds.length - 1; roundIndex += 1) {
+        winnersRounds[roundIndex].forEach((match, i) => {
+            assignWinner(match, winnersRounds[roundIndex + 1][Math.floor(i / 2)], i % 2 === 0 ? "p1Id" : "p2Id");
         });
     }
 
-    rounds[0].forEach((match) => resolveAutoAdvance(match, rounds));
-    return rounds;
-}
-
-function buildRoundRobin(players) {
     const rounds = [];
-    const list = players.length % 2 === 0 ? [...players] : [...players, { id: null, name: "BYE" }];
-    const size = list.length;
-    const roundsCount = size - 1;
-    let arr = [...list];
 
-    for (let r = 0; r < roundsCount; r += 1) {
-        const round = [];
-        for (let i = 0; i < size / 2; i += 1) {
-            const a = arr[i];
-            const b = arr[size - 1 - i];
-            if (!a.id || !b.id) continue;
-            round.push({
-                id: uid(),
-                roundIndex: r,
-                indexInRound: i,
-                p1Id: a.id,
-                p2Id: b.id,
-                score1: null,
-                score2: null,
-                winnerId: null,
-                loserId: null,
-                completed: false,
-                nextMatchId: null,
-                nextSlot: null
+    if (winnersRoundCount === 1) {
+        const grandFinalRound = createRound("Grand Final");
+        const grandFinal = createMatch(0, 0, undefined, undefined, "grand-final");
+        grandFinalRound.push(grandFinal);
+
+        const resetRound = createRound("Grand Final Reset");
+        const resetMatch = createMatch(0, 0, undefined, undefined, "reset-final");
+        resetRound.push(resetMatch);
+
+        assignWinner(winnersRounds[0][0], grandFinal, "p1Id");
+        assignLoser(winnersRounds[0][0], grandFinal, "p2Id");
+
+        rounds.push(winnersRounds[0], grandFinalRound, resetRound);
+        state.double.resetMatchId = resetMatch.id;
+    } else {
+        const losersMinorRounds = [];
+        const losersMajorRounds = [];
+
+        for (let block = 1; block < winnersRoundCount; block += 1) {
+            const matchesInLosersRound = bracketSize / (2 ** (block + 1));
+            const minorRound = createRound(`Losers Round ${block * 2 - 1}`);
+            const majorRound = createRound(`Losers Round ${block * 2}`);
+
+            for (let i = 0; i < matchesInLosersRound; i += 1) {
+                minorRound.push(createMatch(0, i));
+                majorRound.push(createMatch(0, i));
+            }
+
+            losersMinorRounds.push(minorRound);
+            losersMajorRounds.push(majorRound);
+        }
+
+        winnersRounds[0].forEach((match, i) => {
+            const target = losersMinorRounds[0][Math.floor(i / 2)];
+            assignLoser(match, target, i % 2 === 0 ? "p1Id" : "p2Id");
+        });
+
+        for (let block = 1; block < winnersRoundCount; block += 1) {
+            const minorRound = losersMinorRounds[block - 1];
+            const majorRound = losersMajorRounds[block - 1];
+
+            minorRound.forEach((match, i) => {
+                assignWinner(match, majorRound[i], "p1Id");
             });
+
+            winnersRounds[block].forEach((match, i) => {
+                assignLoser(match, majorRound[i], "p2Id");
+            });
+
+            if (block < winnersRoundCount - 1) {
+                const nextMinor = losersMinorRounds[block];
+                majorRound.forEach((match, i) => {
+                    assignWinner(match, nextMinor[Math.floor(i / 2)], i % 2 === 0 ? "p1Id" : "p2Id");
+                });
+            }
         }
-        rounds.push(round);
-        arr = [arr[0], arr[size - 1], ...arr.slice(1, size - 1)];
+
+        const grandFinalRound = createRound("Grand Final");
+        const grandFinal = createMatch(0, 0, undefined, undefined, "grand-final");
+        grandFinalRound.push(grandFinal);
+
+        const resetRound = createRound("Grand Final Reset");
+        const resetMatch = createMatch(0, 0, undefined, undefined, "reset-final");
+        resetRound.push(resetMatch);
+
+        assignWinner(winnersRounds[winnersRounds.length - 1][0], grandFinal, "p1Id");
+        assignWinner(losersMajorRounds[losersMajorRounds.length - 1][0], grandFinal, "p2Id");
+
+        rounds.push(winnersRounds[0]);
+        for (let block = 1; block < winnersRoundCount; block += 1) {
+            rounds.push(losersMinorRounds[block - 1]);
+            rounds.push(winnersRounds[block]);
+            rounds.push(losersMajorRounds[block - 1]);
+        }
+        rounds.push(grandFinalRound, resetRound);
+        state.double.resetMatchId = resetMatch.id;
     }
 
+    rounds.forEach((round, roundIndex) => {
+        round.forEach((match, indexInRound) => {
+            match.roundIndex = roundIndex;
+            match.indexInRound = indexInRound;
+        });
+    });
+
+    winnersRounds[0].forEach((match) => resolveAutoAdvance(match, rounds));
     return rounds;
-}
-
-function buildSwissRound(players, priorRounds) {
-    const standings = calculateStandings(priorRounds, players, "swiss");
-    const sorted = standings.map((row) => row.id);
-    const pairedSet = new Set();
-    const priorPairs = new Set();
-    priorRounds.forEach((round) => {
-        round.forEach((m) => {
-            const key = [m.p1Id, m.p2Id].sort((a, b) => a - b).join(":");
-            priorPairs.add(key);
-        });
-    });
-
-    const matches = [];
-    for (let i = 0; i < sorted.length; i += 1) {
-        const p1 = sorted[i];
-        if (pairedSet.has(p1)) continue;
-
-        let partner = null;
-        for (let j = i + 1; j < sorted.length; j += 1) {
-            const candidate = sorted[j];
-            if (pairedSet.has(candidate)) continue;
-            const key = [p1, candidate].sort((a, b) => a - b).join(":");
-            if (!priorPairs.has(key)) {
-                partner = candidate;
-                break;
-            }
-        }
-
-        if (partner === null) {
-            for (let j = i + 1; j < sorted.length; j += 1) {
-                const candidate = sorted[j];
-                if (!pairedSet.has(candidate)) {
-                    partner = candidate;
-                    break;
-                }
-            }
-        }
-
-        pairedSet.add(p1);
-        if (partner !== null) pairedSet.add(partner);
-
-        matches.push({
-            id: uid(),
-            roundIndex: priorRounds.length,
-            indexInRound: matches.length,
-            p1Id: p1,
-            p2Id: partner,
-            score1: partner === null ? 1 : null,
-            score2: partner === null ? 0 : null,
-            winnerId: partner === null ? p1 : null,
-            loserId: partner === null ? null : null,
-            completed: partner === null,
-            nextMatchId: null,
-            nextSlot: null
-        });
-    }
-
-    return matches;
-}
-
-function buildDoubleRound(players, losses) {
-    const survivors = players.filter((p) => (losses[p.id] || 0) < 2).map((p) => p.id);
-    survivors.sort((a, b) => {
-        const lossA = losses[a] || 0;
-        const lossB = losses[b] || 0;
-        if (lossA !== lossB) return lossA - lossB;
-        return a - b;
-    });
-
-    const used = new Set();
-    const matches = [];
-
-    for (let i = 0; i < survivors.length; i += 1) {
-        const p1 = survivors[i];
-        if (used.has(p1)) continue;
-
-        let partner = null;
-        for (let j = i + 1; j < survivors.length; j += 1) {
-            const p2 = survivors[j];
-            if (used.has(p2)) continue;
-            if ((losses[p2] || 0) === (losses[p1] || 0)) {
-                partner = p2;
-                break;
-            }
-        }
-
-        if (partner === null) {
-            for (let j = i + 1; j < survivors.length; j += 1) {
-                const p2 = survivors[j];
-                if (!used.has(p2)) {
-                    partner = p2;
-                    break;
-                }
-            }
-        }
-
-        used.add(p1);
-        if (partner !== null) used.add(partner);
-
-        matches.push({
-            id: uid(),
-            roundIndex: 0,
-            indexInRound: matches.length,
-            p1Id: p1,
-            p2Id: partner,
-            score1: partner === null ? 1 : null,
-            score2: partner === null ? 0 : null,
-            winnerId: partner === null ? p1 : null,
-            loserId: partner === null ? null : null,
-            completed: partner === null,
-            nextMatchId: null,
-            nextSlot: null
-        });
-    }
-
-    return matches;
 }
 
 function findMatch(matchId) {
@@ -394,6 +540,15 @@ function propagateWinner(match, rounds) {
     resolveAutoAdvance(next, rounds);
 }
 
+function propagateLoser(match, rounds) {
+    if (!match.loserNextMatchId || !match.loserNextSlot || !isRealPlayerId(match.loserId)) return;
+    const next = findMatchById(rounds, match.loserNextMatchId);
+    if (!next) return;
+
+    next[match.loserNextSlot] = match.loserId;
+    resolveAutoAdvance(next, rounds);
+}
+
 function openScoreModal(matchId) {
     const match = findMatch(matchId);
     if (!match || match.completed) return;
@@ -405,11 +560,11 @@ function openScoreModal(matchId) {
         <div class="score-card">
             <h4>Enter score</h4>
             <div class="score-grid">
-                <label>${getPlayerName(match.p1Id)}</label>
+                <label>${escapeHtml(getPlayerName(match.p1Id))}</label>
                 <input type="number" min="0" step="1" id="score-a" />
             </div>
             <div class="score-grid">
-                <label>${getPlayerName(match.p2Id)}</label>
+                <label>${escapeHtml(getPlayerName(match.p2Id))}</label>
                 <input type="number" min="0" step="1" id="score-b" />
             </div>
             <div class="score-actions">
@@ -434,7 +589,7 @@ function openScoreModal(matchId) {
             return;
         }
 
-        if ((state.type === "single" || state.type === "double") && a === b) {
+        if (a === b) {
             alert("Elimination matches cannot end in a draw.");
             return;
         }
@@ -464,385 +619,286 @@ function finalizeMatch(match, score1, score2) {
         match.loserId = null;
     }
 
-    if (state.type === "single" || state.type === "double") {
-        if (state.type === "single") {
-            propagateWinner(match, state.rounds);
-        } else {
-            if (isRealPlayerId(match.loserId)) {
-                state.double.losses[match.loserId] = (state.double.losses[match.loserId] || 0) + 1;
-            }
-
-            const currentRound = state.rounds[state.rounds.length - 1];
-            const allDone = currentRound.every((m) => m.completed);
-            if (allDone) {
-                const alive = state.players.filter((p) => (state.double.losses[p.id] || 0) < 2);
-                if (alive.length > 1) {
-                    const nextRound = buildDoubleRound(state.players, state.double.losses);
-                    if (nextRound.length > 0) {
-                        nextRound.forEach((m, idx) => {
-                            m.roundIndex = state.rounds.length;
-                            m.indexInRound = idx;
-                        });
-                        state.rounds.push(nextRound);
-                    }
-                }
-            }
-        }
+    if (isRealPlayerId(match.loserId)) {
+        state.double.losses[match.loserId] = (state.double.losses[match.loserId] || 0) + 1;
     }
 
-    if (state.type === "swiss") {
-        const lastRound = state.rounds[state.rounds.length - 1];
-        const allComplete = lastRound.length > 0 && lastRound.every((m) => m.completed);
-        if (allComplete && state.rounds.length < state.swiss.maxRounds) {
-            const nextRound = buildSwissRound(state.players, state.rounds);
-            if (nextRound.length > 0) {
-                state.rounds.push(nextRound);
+    if (match.bracketRole === "grand-final") {
+        const p1Losses = isRealPlayerId(match.p1Id) ? (state.double.losses[match.p1Id] || 0) : 0;
+        const p2Losses = isRealPlayerId(match.p2Id) ? (state.double.losses[match.p2Id] || 0) : 0;
+        const needsReset = p1Losses === 1 && p2Losses === 1;
+
+        if (needsReset && state.double.resetMatchId) {
+            const resetMatch = findMatch(state.double.resetMatchId);
+            if (resetMatch) {
+                resetMatch.p1Id = match.winnerId;
+                resetMatch.p2Id = match.loserId;
+                resetMatch.score1 = null;
+                resetMatch.score2 = null;
+                resetMatch.winnerId = null;
+                resetMatch.loserId = null;
+                resetMatch.completed = false;
             }
         }
+    } else if (match.bracketRole !== "reset-final") {
+        propagateWinner(match, state.rounds);
+        propagateLoser(match, state.rounds);
     }
 }
 
-function calculateStandings(rounds, players, mode) {
-    const map = new Map();
-    players.forEach((p) => {
-        map.set(p.id, {
-            id: p.id,
-            name: p.name,
-            played: 0,
-            wins: 0,
-            draws: 0,
-            losses: 0,
-            scored: 0,
-            conceded: 0,
-            points: 0
+function getRoundMeta(round) {
+    const countLabel = `${round.length} match${round.length === 1 ? "" : "es"}`;
+    if (round.title === "Grand Final Reset") {
+        return "If needed";
+    }
+    return countLabel;
+}
+
+function createMatchCard(match, extraClass = "") {
+    const card = document.createElement("div");
+    card.className = `match ${match.completed ? "completed" : ""} ${extraClass}`.trim();
+
+    const p1Name = getPlayerName(match.p1Id);
+    const p2Name = getPlayerName(match.p2Id);
+    const p1Winner = match.completed && match.winnerId === match.p1Id;
+    const p2Winner = match.completed && match.winnerId === match.p2Id;
+    const clickable = !match.completed && isRealPlayerId(match.p1Id) && isRealPlayerId(match.p2Id);
+
+    if (clickable) {
+        card.classList.add("clickable");
+        card.addEventListener("click", () => openScoreModal(match.id));
+    }
+
+    card.innerHTML = `
+        <div class="player-row ${p1Winner ? "winner" : ""} ${match.p1Id === null ? "bye" : ""}">
+            <span>${escapeHtml(p1Name)}</span>
+            <strong>${match.score1 !== null ? match.score1 : ""}</strong>
+        </div>
+        <div class="player-row ${p2Winner ? "winner" : ""} ${match.p2Id === null ? "bye" : ""}">
+            <span>${escapeHtml(p2Name)}</span>
+            <strong>${match.score2 !== null ? match.score2 : ""}</strong>
+        </div>
+        <div class="match-meta">${clickable ? "Click to enter score" : match.completed ? "Completed" : "Waiting"}</div>
+    `;
+
+    return card;
+}
+
+function drawConnector(svg, x1, y1, x2, y2, className) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    const horizontalSpan = Math.max(48, x2 - x1);
+    const isLoserPath = className.includes("loser-path");
+    const elbowRatio = isLoserPath ? 0.28 : 0.72;
+    const elbowX = Math.min(x2 - 24, x1 + horizontalSpan * elbowRatio);
+    path.setAttribute("d", `M ${x1} ${y1} H ${elbowX} V ${y2} H ${x2}`);
+    path.setAttribute("class", className);
+    svg.appendChild(path);
+}
+
+function renderDoubleBracket(container) {
+    if (state.rounds.length === 0) return;
+
+    const matchWidth = 220;
+    const matchHeight = 92;
+    const roundGap = 72;
+    const laneGap = 72;
+    const laneTitleHeight = 34;
+    const roundBadgeHeight = 32;
+    const laneHeaderGap = 10;
+    const roundContentOffset = roundBadgeHeight + 12;
+    const pad = 28;
+    const winnersUnit = 52;
+
+    const winnersRounds = state.rounds.filter((round) => round.title?.startsWith("Winners"));
+    const losersRounds = state.rounds.filter((round) => round.title?.startsWith("Losers"));
+    const finalsRounds = state.rounds.filter((round) => {
+        if (!round.title?.startsWith("Grand")) return false;
+        if (round.title !== "Grand Final Reset") return true;
+        return round.some((match) => match.p1Id !== undefined || match.p2Id !== undefined || match.completed);
+    });
+
+    const calcLaneHeight = (rounds, getTop) => {
+        let height = laneTitleHeight + laneHeaderGap + roundContentOffset + matchHeight;
+        rounds.forEach((round, roundIndex) => {
+            round.forEach((match, matchIndex) => {
+                height = Math.max(height, laneTitleHeight + laneHeaderGap + getTop(roundIndex, matchIndex) + matchHeight + 24);
+            });
         });
-    });
+        return height;
+    };
 
-    rounds.forEach((round) => {
-        round.forEach((m) => {
-            if (!m.completed) return;
+    const winnersTop = (roundIndex, matchIndex) => roundContentOffset + (2 ** roundIndex) * (matchIndex * 2 + 1) * winnersUnit;
+    const losersTop = (roundIndex, matchIndex) => roundContentOffset + matchIndex * 126 + roundIndex * 18;
 
-            if (isRealPlayerId(m.p1Id) && m.p2Id === null) {
-                const aBye = map.get(m.p1Id);
-                if (!aBye) return;
-                aBye.played += 1;
-                aBye.wins += 1;
-                aBye.scored += m.score1 ?? 1;
-                aBye.points += mode === "swiss" ? 1 : 3;
-                return;
-            }
+    const winnersHeight = calcLaneHeight(winnersRounds, winnersTop);
+    const losersHeight = calcLaneHeight(losersRounds, losersTop);
+    const laneWidth = (rounds) => Math.max(1, rounds.length) * matchWidth + Math.max(0, rounds.length - 1) * roundGap;
+    const winnersWidth = laneWidth(winnersRounds);
+    const losersWidth = laneWidth(losersRounds);
+    const finalsWidth = Math.max(1, finalsRounds.length) * matchWidth + Math.max(0, finalsRounds.length - 1) * roundGap;
+    const contentWidth = pad * 2 + Math.max(winnersWidth, losersWidth) + laneGap + finalsWidth;
+    const contentHeight = pad * 2 + winnersHeight + laneGap + losersHeight;
 
-            if (isRealPlayerId(m.p2Id) && m.p1Id === null) {
-                const bBye = map.get(m.p2Id);
-                if (!bBye) return;
-                bBye.played += 1;
-                bBye.wins += 1;
-                bBye.scored += m.score2 ?? 1;
-                bBye.points += mode === "swiss" ? 1 : 3;
-                return;
-            }
+    const stage = document.createElement("div");
+    stage.className = "double-bracket";
+    stage.style.width = `${contentWidth}px`;
+    stage.style.height = `${contentHeight}px`;
 
-            if (!isRealPlayerId(m.p1Id) || !isRealPlayerId(m.p2Id)) return;
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.classList.add("double-lines");
+    svg.setAttribute("viewBox", `0 0 ${contentWidth} ${contentHeight}`);
+    stage.appendChild(svg);
 
-            const a = map.get(m.p1Id);
-            const b = map.get(m.p2Id);
-            if (!a || !b) return;
+    const matchElements = new Map();
 
-            a.played += 1;
-            b.played += 1;
-            a.scored += m.score1;
-            b.scored += m.score2;
-            a.conceded += m.score2;
-            b.conceded += m.score1;
+    const renderLane = (title, rounds, className, x, y, getTop, metaOffset = 0) => {
+        const lane = document.createElement("section");
+        lane.className = `double-lane ${className}`;
+        lane.style.left = `${x}px`;
+        lane.style.top = `${y}px`;
+        lane.style.width = `${laneWidth(rounds)}px`;
+        lane.style.height = `${calcLaneHeight(rounds, getTop)}px`;
 
-            if (m.score1 > m.score2) {
-                a.wins += 1;
-                b.losses += 1;
-                a.points += mode === "swiss" ? 1 : 3;
-            } else if (m.score2 > m.score1) {
-                b.wins += 1;
-                a.losses += 1;
-                b.points += mode === "swiss" ? 1 : 3;
-            } else {
-                a.draws += 1;
-                b.draws += 1;
-                if (mode !== "single" && mode !== "double") {
-                    a.points += 0.5;
-                    b.points += 0.5;
-                }
-            }
+        const laneTitle = document.createElement("div");
+        laneTitle.className = "double-lane-title";
+        laneTitle.textContent = title;
+        lane.appendChild(laneTitle);
+
+        rounds.forEach((round, roundIndex) => {
+            const roundEl = document.createElement("div");
+            roundEl.className = "double-round";
+            roundEl.style.left = `${roundIndex * (matchWidth + roundGap)}px`;
+            roundEl.style.top = `${laneTitleHeight + laneHeaderGap}px`;
+            roundEl.style.width = `${matchWidth}px`;
+            roundEl.style.height = `${Math.max(120, calcLaneHeight(rounds, getTop) - (laneTitleHeight + laneHeaderGap))}px`;
+
+            const badge = document.createElement("div");
+            badge.className = "round-badge";
+            badge.textContent = round.title;
+            roundEl.appendChild(badge);
+
+            round.forEach((match, matchIndex) => {
+                const roleClass = match.bracketRole
+                    ? `match-${match.bracketRole}`
+                    : className === "winners"
+                        ? "match-winners"
+                        : "match-losers";
+                const card = createMatchCard(match, roleClass);
+                card.style.position = "absolute";
+                card.style.left = "0";
+                card.style.top = `${getTop(roundIndex, matchIndex) + metaOffset}px`;
+                roundEl.appendChild(card);
+                matchElements.set(match.id, card);
+            });
+
+            lane.appendChild(roundEl);
         });
+
+        stage.appendChild(lane);
+    };
+
+    renderLane("Winners Bracket", winnersRounds, "winners", pad, pad, winnersTop);
+    renderLane("Losers Bracket", losersRounds, "losers", pad, pad + winnersHeight + laneGap, losersTop);
+
+    const finalsLane = document.createElement("section");
+    finalsLane.className = "double-lane finals";
+    finalsLane.style.left = `${pad + Math.max(winnersWidth, losersWidth) + laneGap}px`;
+    finalsLane.style.top = `${pad + Math.max(24, (contentHeight - pad * 2 - 220) / 2)}px`;
+    finalsLane.style.width = `${finalsWidth}px`;
+    finalsLane.style.height = "220px";
+
+    const finalsTitle = document.createElement("div");
+    finalsTitle.className = "double-lane-title";
+    finalsTitle.textContent = "Finals";
+    finalsLane.appendChild(finalsTitle);
+
+    finalsRounds.forEach((round, roundIndex) => {
+        const roundEl = document.createElement("div");
+        roundEl.className = "double-round";
+        roundEl.style.left = `${roundIndex * (matchWidth + roundGap)}px`;
+        roundEl.style.top = `${laneTitleHeight + laneHeaderGap}px`;
+        roundEl.style.width = `${matchWidth}px`;
+        roundEl.style.height = `${220 - (laneTitleHeight + laneHeaderGap)}px`;
+
+        const badge = document.createElement("div");
+        badge.className = "round-badge";
+        badge.textContent = round.title;
+        roundEl.appendChild(badge);
+
+        round.forEach((match, matchIndex) => {
+            const card = createMatchCard(match, match.bracketRole === "reset-final" ? "match-reset" : "match-grand-final");
+            card.style.position = "absolute";
+            card.style.left = "0";
+            card.style.top = `${roundContentOffset + matchIndex * 126}px`;
+            roundEl.appendChild(card);
+            matchElements.set(match.id, card);
+        });
+
+        finalsLane.appendChild(roundEl);
     });
 
-    const list = [...map.values()];
-    list.sort((x, y) => {
-        if (y.points !== x.points) return y.points - x.points;
-        const xDiff = x.scored - x.conceded;
-        const yDiff = y.scored - y.conceded;
-        if (yDiff !== xDiff) return yDiff - xDiff;
-        return y.scored - x.scored;
+    stage.appendChild(finalsLane);
+    container.appendChild(stage);
+
+    const stageRect = stage.getBoundingClientRect();
+    state.rounds.flat().forEach((match) => {
+        const sourceEl = matchElements.get(match.id);
+        if (!sourceEl) return;
+        const sourceRect = sourceEl.getBoundingClientRect();
+        const x1 = sourceRect.right - stageRect.left;
+        const y1 = sourceRect.top - stageRect.top + sourceRect.height / 2;
+
+        if (match.nextMatchId) {
+            const targetEl = matchElements.get(match.nextMatchId);
+            if (targetEl) {
+                const targetRect = targetEl.getBoundingClientRect();
+                drawConnector(
+                    svg,
+                    x1,
+                    y1,
+                    targetRect.left - stageRect.left,
+                    targetRect.top - stageRect.top + targetRect.height / 2,
+                    "double-path winner-path"
+                );
+            }
+        }
+
+        if (match.loserNextMatchId) {
+            const targetEl = matchElements.get(match.loserNextMatchId);
+            if (targetEl) {
+                const targetRect = targetEl.getBoundingClientRect();
+                drawConnector(
+                    svg,
+                    x1,
+                    y1,
+                    targetRect.left - stageRect.left,
+                    targetRect.top - stageRect.top + targetRect.height / 2,
+                    "double-path loser-path"
+                );
+            }
+        }
     });
-    return list;
 }
 
 function render() {
     ui.note.textContent = state.note;
     ui.standingsDisplay.innerHTML = "";
     ui.bracketDisplay.innerHTML = "";
-
-    if (state.type === "single") ui.title.textContent = "Single Elimination";
-    if (state.type === "double") ui.title.textContent = "Double Elimination";
-    if (state.type === "round-robin") ui.title.textContent = "Round Robin";
-    if (state.type === "swiss") ui.title.textContent = "Swiss System";
+    ui.title.textContent = "Double Elimination";
 
     // Clear and prepare bracket display
     ui.bracketDisplay.innerHTML = '';
     const bracketContainer = document.createElement('div');
     bracketContainer.className = 'bracket-container';
+    bracketContainer.dataset.type = "double";
     ui.bracketDisplay.appendChild(bracketContainer);
 
-    if (state.type === "single" || state.type === "double") {
-        renderBracket(bracketContainer);
-    } else {
-        // For round-robin and swiss, use the simple list view
-        renderSimpleBracket(bracketContainer);
+    renderDoubleBracket(bracketContainer);
+
+    const alive = state.players.filter((player) => (state.double.losses[player.id] || 0) < 2);
+    if (alive.length === 1) {
+        ui.note.textContent = `Champion: ${alive[0].name}`;
     }
-
-    if (state.type === "double") {
-        const alive = state.players.filter((p) => (state.double.losses[p.id] || 0) < 2);
-        if (alive.length === 1) {
-            ui.note.textContent = `Champion: ${alive[0].name}`;
-        }
-    }
-
-    if (state.type === "round-robin" || state.type === "swiss") {
-        renderStandings();
-    }
-}
-
-function renderBracket(container) {
-    if (state.rounds.length === 0) return;
-    
-    // Create SVG for bracket lines
-    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.className = "bracket-lines";
-    svg.style.position = "absolute";
-    svg.style.top = "0";
-    svg.style.left = "0";
-    svg.style.width = "100%";
-    svg.style.height = "100%";
-    svg.style.pointerEvents = "none";
-    container.appendChild(svg);
-    
-    // Create container for match elements
-    const matchesContainer = document.createElement('div');
-    matchesContainer.className = 'matches-container';
-    matchesContainer.style.position = "relative";
-    matchesContainer.style.zIndex = "10";
-    container.appendChild(matchesContainer);
-    
-    // Calculate dimensions
-    const roundCount = state.rounds.length;
-    const roundGap = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--round-gap')) || 140;
-    const verticalGap = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--vertical-gap')) || 50;
-    const matchWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--match-width')) || 200;
-    const matchHeight = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--match-height')) || 90;
-    
-    // Position each round
-    state.rounds.forEach((round, roundIndex) => {
-        const roundGroup = document.createElement('div');
-        roundGroup.className = 'round-group';
-        roundGroup.style.position = 'absolute';
-        roundGroup.style.left = `${roundIndex * (matchWidth + roundGap)}px`;
-        matchesContainer.appendChild(roundGroup);
-        
-        // Position matches in this round
-        round.forEach((match, matchIndex) => {
-            const matchEl = document.createElement('div');
-            matchEl.className = `match ${match.completed ? 'completed' : ''}`;
-            matchEl.dataset.matchId = match.id;
-            
-            // Calculate vertical position
-            const spacing = verticalGap * 2; // Space between match slots
-            const baseOffset = (matchIndex * 2 + 1) * spacing; // Account for byes/empty slots
-            matchEl.style.top = `${baseOffset}px`;
-            
-            // Get player names
-            const p1Name = getPlayerName(match.p1Id);
-            const p2Name = getPlayerName(match.p2Id);
-            const p1Winner = match.completed && match.winnerId === match.p1Id;
-            const p2Winner = match.completed && match.winnerId === match.p2Id;
-            const clickable = !match.completed && isRealPlayerId(match.p1Id) && isRealPlayerId(match.p2Id);
-            
-            if (clickable) {
-                matchEl.classList.add('clickable');
-                matchEl.addEventListener('click', () => openScoreModal(match.id));
-            }
-            
-            matchEl.innerHTML = `
-                <div class="player-info">
-                    <span class="player-name">${p1Name}</span>
-                    <span class="player-score ${p1Winner ? 'winner' : ''}">${match.score1 !== null ? match.score1 : ''}</span>
-                </div>
-                <div class="versus">VS</div>
-                <div class="player-info">
-                    <span class="player-name">${p2Name}</span>
-                    <span class="player-score ${p2Winner ? 'winner' : ''}">${match.score2 !== null ? match.score2 : ''}</span>
-                </div>
-                <div class="match-meta">${clickable ? 'Click to enter score' : match.completed ? 'Completed' : 'Waiting'}</div>
-            `;
-            
-            roundGroup.appendChild(matchEl);
-            
-            // Draw connector lines to next round
-            if (match.nextMatchId && match.nextSlot) {
-                const nextMatch = findMatchById(state.rounds[roundIndex + 1] || [], match.nextMatchId);
-                if (nextMatch) {
-                    // Calculate line positions
-                    const x1 = roundIndex * (matchWidth + roundGap) + matchWidth;
-                    const y1 = baseOffset + (matchHeight / 2);
-                    
-                    let x2, y2;
-                    if (match.nextSlot === 'p1Id') {
-                        // Connect to top half of next match
-                        x2 = (roundIndex + 1) * (matchWidth + roundGap);
-                        y2 = (matchIndex * spacing * 2) + (matchHeight / 2);
-                    } else {
-                        // Connect to bottom half of next match
-                        x2 = (roundIndex + 1) * (matchWidth + roundGap);
-                        y2 = ((matchIndex * 2 + 1) * spacing * 2) + (matchHeight / 2);
-                    }
-                    
-                    // Draw horizontal line from match to middle
-                    const hLine1 = document.createElementNS("http://www.w3.org/2000/svg", "line");
-                    hLine1.setAttribute('x1', x1);
-                    hLine1.setAttribute('y1', y1);
-                    hLine1.setAttribute('x2', x1 + 20);
-                    hLine1.setAttribute('y2', y1);
-                    hLine1.setAttribute('stroke', 'var(--line)');
-                    hLine1.setAttribute('stroke-width', '2');
-                    svg.appendChild(hLine1);
-                    
-                    // Draw vertical line
-                    const vLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
-                    vLine.setAttribute('x1', x1 + 20);
-                    vLine.setAttribute('y1', y1);
-                    vLine.setAttribute('x2', x1 + 20);
-                    vLine.setAttribute('y2', y2);
-                    vLine.setAttribute('stroke', 'var(--line)');
-                    vLine.setAttribute('stroke-width', '2');
-                    svg.appendChild(vLine);
-                    
-                    // Draw horizontal line to next match
-                    const hLine2 = document.createElementNS("http://www.w3.org/2000/svg", "line");
-                    hLine2.setAttribute('x1', x1 + 20);
-                    hLine2.setAttribute('y2', y2);
-                    hLine2.setAttribute('x2', x2);
-                    hLine2.setAttribute('y2', y2);
-                    hLine2.setAttribute('stroke', 'var(--line)');
-                    hLine2.setAttribute('stroke-width', '2');
-                    svg.appendChild(hLine2);
-                }
-            }
-        });
-    });
-    
-    // Set container height based on content
-    const totalHeight = Math.round((Math.pow(2, state.rounds.length)) * verticalGap * 2);
-    container.style.minHeight = `${totalHeight}px`;
-}
-
-function renderSimpleBracket(container) {
-    // For round-robin and swiss, use the previous simple list view
-    const grid = document.createElement("div");
-    grid.className = "bracket-grid";
-
-    state.rounds.forEach((round, idx) => {
-        const col = document.createElement("div");
-        col.className = "round-column";
-
-        const title = document.createElement("h3");
-        title.className = "round-title";
-        title.textContent = `Round ${idx + 1}`;
-        col.appendChild(title);
-
-        round.forEach((m) => {
-            const card = document.createElement("div");
-            card.className = `match ${m.completed ? "completed" : ""}`;
-
-            const p1Name = getPlayerName(m.p1Id);
-            const p2Name = getPlayerName(m.p2Id);
-            const p1Winner = m.completed && m.winnerId === m.p1Id;
-            const p2Winner = m.completed && m.winnerId === m.p2Id;
-            const clickable = !m.completed && isRealPlayerId(m.p1Id) && isRealPlayerId(m.p2Id);
-
-            if (clickable) {
-                card.classList.add("clickable");
-                card.addEventListener("click", () => openScoreModal(m.id));
-            }
-
-            card.innerHTML = `
-                <div class="player-row ${p1Winner ? "winner" : ""} ${m.p1Id === null ? "bye" : ""}">
-                    <span>${p1Name}</span>
-                    <strong>${m.score1 !== null ? m.score1 : ""}</strong>
-                </div>
-                <div class="player-row ${p2Winner ? "winner" : ""} ${m.p2Id === null ? "bye" : ""}">
-                    <span>${p2Name}</span>
-                    <strong>${m.score2 !== null ? m.score2 : ""}</strong>
-                </div>
-                <div class="match-meta">${clickable ? "Click to enter score" : m.completed ? "Completed" : "Waiting"}</div>
-            `;
-
-            col.appendChild(card);
-        });
-
-        grid.appendChild(col);
-    });
-
-    container.appendChild(grid);
-}
-
-function renderStandings() {
-    const standings = calculateStandings(state.rounds, state.players, state.type);
-    const wrap = document.createElement("div");
-    wrap.className = "standings";
-    wrap.innerHTML = `
-        <h3>Standings</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>#</th>
-                    <th>Player</th>
-                    <th>P</th>
-                    <th>W</th>
-                    <th>D</th>
-                    <th>L</th>
-                    <th>GF</th>
-                    <th>GA</th>
-                    <th>Pts</th>
-                </tr>
-            </thead>
-            <tbody></tbody>
-        </table>
-    `;
-
-    const tbody = wrap.querySelector("tbody");
-    standings.forEach((row, idx) => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-            <td>${idx + 1}</td>
-            <td>${row.name}</td>
-            <td>${row.played}</td>
-            <td>${row.wins}</td>
-            <td>${row.draws}</td>
-            <td>${row.losses}</td>
-            <td>${row.scored}</td>
-            <td>${row.conceded}</td>
-            <td>${row.points}</td>
-        `;
-        tbody.appendChild(tr);
-    });
-    ui.standingsDisplay.appendChild(wrap);
 }
 
 function exportTournament() {
@@ -866,14 +922,7 @@ function importTournament(event) {
     reader.onload = (e) => {
         try {
             const payload = JSON.parse(e.target.result);
-            if (!payload.state || !Array.isArray(payload.state.players) || !Array.isArray(payload.state.rounds)) {
-                throw new Error("Invalid file format.");
-            }
-
-            state = payload.state;
-            if (!state.double) state.double = { losses: {} };
-            if (!state.swiss) state.swiss = { maxRounds: 0 };
-            nextId = typeof payload.nextId === "number" ? payload.nextId : 1;
+            state = normalizeImportedState(payload);
             ui.setupSection.classList.add("hidden");
             ui.bracketSection.classList.remove("hidden");
             render();
@@ -886,14 +935,7 @@ function importTournament(event) {
 }
 
 function resetTournament() {
-    state = {
-        players: [],
-        type: "",
-        rounds: [],
-        note: "",
-        swiss: { maxRounds: 0 },
-        double: { losses: {} }
-    };
+    state = createEmptyState();
 
     ui.setupSection.classList.remove("hidden");
     ui.bracketSection.classList.add("hidden");
