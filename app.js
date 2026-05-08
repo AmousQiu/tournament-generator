@@ -34,7 +34,6 @@ const ui = {
     playerCount: null,
     playerNames: null,
     bracketDisplay: null,
-    standingsDisplay: null,
     note: null,
     title: null,
     importFile: null
@@ -46,7 +45,6 @@ document.addEventListener("DOMContentLoaded", () => {
     ui.playerCount = document.getElementById("player-count");
     ui.playerNames = document.getElementById("player-names");
     ui.bracketDisplay = document.getElementById("bracket-display");
-    ui.standingsDisplay = document.getElementById("standings-display");
     ui.note = document.getElementById("tournament-note");
     ui.title = document.getElementById("view-title");
     ui.importFile = document.getElementById("import-file");
@@ -520,6 +518,7 @@ function resolveAutoAdvance(match, rounds) {
         match.winnerId = match.p1Id;
         match.loserId = null;
         propagateWinner(match, rounds);
+        propagateLoser(match, rounds);
         return;
     }
 
@@ -528,6 +527,7 @@ function resolveAutoAdvance(match, rounds) {
         match.winnerId = match.p2Id;
         match.loserId = match.p1Id;
         propagateWinner(match, rounds);
+        propagateLoser(match, rounds);
     }
 }
 
@@ -541,7 +541,7 @@ function propagateWinner(match, rounds) {
 }
 
 function propagateLoser(match, rounds) {
-    if (!match.loserNextMatchId || !match.loserNextSlot || !isRealPlayerId(match.loserId)) return;
+    if (!match.loserNextMatchId || !match.loserNextSlot) return;
     const next = findMatchById(rounds, match.loserNextMatchId);
     if (!next) return;
 
@@ -698,16 +698,17 @@ function drawConnector(svg, x1, y1, x2, y2, className) {
 function renderDoubleBracket(container) {
     if (state.rounds.length === 0) return;
 
-    const matchWidth = 220;
+    const matchWidth = 216;
     const matchHeight = 92;
-    const roundGap = 72;
-    const laneGap = 72;
-    const laneTitleHeight = 34;
-    const roundBadgeHeight = 32;
-    const laneHeaderGap = 10;
-    const roundContentOffset = roundBadgeHeight + 12;
-    const pad = 28;
+    const roundGap = 56;
+    const laneGap = 48;
+    const pad = 20;
+    const laneTitleHeight = 28;
+    const roundBadgeHeight = 22;
+    const laneHeaderGap = 6;
+    const roundContentOffset = roundBadgeHeight + 6;
     const winnersUnit = 52;
+    const losersRowGap = 116;
 
     const winnersRounds = state.rounds.filter((round) => round.title?.startsWith("Winners"));
     const losersRounds = state.rounds.filter((round) => round.title?.startsWith("Losers"));
@@ -728,7 +729,7 @@ function renderDoubleBracket(container) {
     };
 
     const winnersTop = (roundIndex, matchIndex) => roundContentOffset + (2 ** roundIndex) * (matchIndex * 2 + 1) * winnersUnit;
-    const losersTop = (roundIndex, matchIndex) => roundContentOffset + matchIndex * 126 + roundIndex * 18;
+    const losersTop = (roundIndex, matchIndex) => roundContentOffset + matchIndex * losersRowGap + roundIndex * 14;
 
     const winnersHeight = calcLaneHeight(winnersRounds, winnersTop);
     const losersHeight = calcLaneHeight(losersRounds, losersTop);
@@ -736,8 +737,15 @@ function renderDoubleBracket(container) {
     const winnersWidth = laneWidth(winnersRounds);
     const losersWidth = laneWidth(losersRounds);
     const finalsWidth = Math.max(1, finalsRounds.length) * matchWidth + Math.max(0, finalsRounds.length - 1) * roundGap;
+    const finalsHeight = Math.max(
+        208,
+        laneTitleHeight + laneHeaderGap + roundContentOffset + (finalsRounds.length * (matchHeight + 20))
+    );
     const contentWidth = pad * 2 + Math.max(winnersWidth, losersWidth) + laneGap + finalsWidth;
-    const contentHeight = pad * 2 + winnersHeight + laneGap + losersHeight;
+    const contentHeight = Math.max(
+        pad * 2 + winnersHeight + laneGap + losersHeight,
+        pad * 2 + finalsHeight + 12
+    );
 
     const stage = document.createElement("div");
     stage.className = "double-bracket";
@@ -803,9 +811,9 @@ function renderDoubleBracket(container) {
     const finalsLane = document.createElement("section");
     finalsLane.className = "double-lane finals";
     finalsLane.style.left = `${pad + Math.max(winnersWidth, losersWidth) + laneGap}px`;
-    finalsLane.style.top = `${pad + Math.max(24, (contentHeight - pad * 2 - 220) / 2)}px`;
+    finalsLane.style.top = `${pad + Math.max(24, Math.round((contentHeight - pad * 2 - finalsHeight) / 2))}px`;
     finalsLane.style.width = `${finalsWidth}px`;
-    finalsLane.style.height = "220px";
+    finalsLane.style.height = `${finalsHeight}px`;
 
     const finalsTitle = document.createElement("div");
     finalsTitle.className = "double-lane-title";
@@ -818,7 +826,7 @@ function renderDoubleBracket(container) {
         roundEl.style.left = `${roundIndex * (matchWidth + roundGap)}px`;
         roundEl.style.top = `${laneTitleHeight + laneHeaderGap}px`;
         roundEl.style.width = `${matchWidth}px`;
-        roundEl.style.height = `${220 - (laneTitleHeight + laneHeaderGap)}px`;
+        roundEl.style.height = `${finalsHeight - (laneTitleHeight + laneHeaderGap)}px`;
 
         const badge = document.createElement("div");
         badge.className = "round-badge";
@@ -829,7 +837,7 @@ function renderDoubleBracket(container) {
             const card = createMatchCard(match, match.bracketRole === "reset-final" ? "match-reset" : "match-grand-final");
             card.style.position = "absolute";
             card.style.left = "0";
-            card.style.top = `${roundContentOffset + matchIndex * 126}px`;
+            card.style.top = `${roundContentOffset + matchIndex * (matchHeight + 22)}px`;
             roundEl.appendChild(card);
             matchElements.set(match.id, card);
         });
@@ -882,7 +890,6 @@ function renderDoubleBracket(container) {
 
 function render() {
     ui.note.textContent = state.note;
-    ui.standingsDisplay.innerHTML = "";
     ui.bracketDisplay.innerHTML = "";
     ui.title.textContent = "Double Elimination";
 
@@ -939,6 +946,5 @@ function resetTournament() {
 
     ui.setupSection.classList.remove("hidden");
     ui.bracketSection.classList.add("hidden");
-    ui.standingsDisplay.innerHTML = "";
     generatePlayerFields();
 }
