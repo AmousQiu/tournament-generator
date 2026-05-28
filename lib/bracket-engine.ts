@@ -106,12 +106,12 @@ export function completeMatch(tournament: Tournament, matchId: string, input: Sc
   const scoreB = Number(input.scoreB);
   const loserId = input.winnerId === match.slotA.playerId ? match.slotB.playerId : match.slotA.playerId;
 
-  return applyResult(tournament, matchId, {
+  return autoResolveByes(applyResult(tournament, matchId, {
     winnerId: input.winnerId,
     loserId,
     scoreA,
     scoreB
-  });
+  }));
 }
 
 export function undoMatch(tournament: Tournament, matchId: string): Tournament {
